@@ -1,0 +1,26 @@
+name:                synthtest
+version:             0.1.0.0
+description:         test synth
+homepage:            https://github.com/o1lo01ol1o/synthtest
+bug-reports:         https://github.com/o1lo01ol1o/synthtest/issues
+license:             MIT
+license-file:        LICENSE
+author:              none
+maintainer:          tim.pierson@gmail.com
+copyright:           2017 none
+category:            TEsting
+build-type:          Simple
+extra-source-files:  README.md
+cabal-version:       >=1.10
+tested-with:         GHC == 8.2.1
+
+library
+  hs-source-dirs:      src
+  exposed-modules:     Lib
+  ghc-options:         -Wall
+  build-depends:       base
+  default-language:    Haskell2010
+
+source-repository head
+  type:                git
+  location:            https://github.com/o1lo01ol1o/synthtest.git
