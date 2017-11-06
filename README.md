@@ -8,6 +8,6 @@
 
 requires JACK, LLVM 5.0 & libffi.
 
-See accelerate installation instructions.
+See accelerate installation instructions: https://github.com/AccelerateHS/accelerate-llvm
 
 jack server needs to be running : https://github.com/jackaudio/jackaudio.github.com/wiki/jackd%281%29
