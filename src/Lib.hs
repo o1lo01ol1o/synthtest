@@ -222,7 +222,7 @@ runSignal ::
 runSignal s i =
     let (AccSample r, SF _) = runSF (strip s) i
     in r
-    
+
 -- Tell accelerate to run a signal that is parameterized by A.Acc b and which outputs an AccSample i l a to a storable vector.
 class Interpreter i where
   runToStorable ::
@@ -230,13 +230,19 @@ class Interpreter i where
     => Signal c (A.Acc b) (AccSample i l a)
     -> b
     -> AIO.Vectors (AS.EltRepr a)
+  evalToStorable ::
+       (Num a, A.Elt a)
+    => Signal c () (AccSample i l a)
+    -> AIO.Vectors (AS.EltRepr a)
 
 
 instance Interpreter CUDA where
   runToStorable sig n = AIO.toVectors $ AI.run1 (runSignal sig) n
+  evalToStorable sig = AIO.toVectors $ AI.run (runSignal sig ()) 
 
 instance Interpreter LLVM where
   runToStorable sig n = AIO.toVectors $ AL.run1 (runSignal sig) n
+  evalToStorable sig = AIO.toVectors $ AL.run (runSignal sig ())
 
 
 wrap
@@ -304,7 +310,7 @@ osc
        (Clock p aa, ArrowCircuit a, A.FromIntegral Int aa, Floating aa, KnownNat l, Numeric aa, A.Ord aa, A.ToFloating Int aa)
     => Table aa -> A.Exp aa -> ArrowP a p (A.Exp aa) (AccSample i l aa)
 osc table@(Table sz _ _) iphs =
-    let ofst =
+    let ofst = -- why is this offset this value?  sample size / block = window?
             A.fromIntegral (A.the sz) A./
             (A.the $ A.unit (fromIntegral $ natVal (Proxy :: Proxy l)))
     in osc_ iphs ofst >>> readFromTableA table
@@ -346,5 +352,4 @@ sineWave rt =
                nrm = A.unit ( A.lift False)
                sz = A.unit (A.lift rt)
                tbl = funToTable A.sin nrm sz
-               _ = trace $ show tbl
            in proc _ ->  osc tbl (A.the $ A.unit 0) -< freq
