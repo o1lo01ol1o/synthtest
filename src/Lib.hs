@@ -17,8 +17,11 @@ module Lib
   , AudRate
   , Table(..)
   , Backend(..)
+  , arrange
+  , unsafeFrameToQueue
+  , generateSample
   ) where
-import Control.Arrow 
+import Control.Arrow
 import Control.Arrow.Operations
 import Data.Proxy (Proxy(Proxy))
 import GHC.TypeLits (KnownNat, natVal, Nat)
@@ -26,12 +29,22 @@ import Control.Category
 import Utils
 import Debug.Trace (trace)
 import qualified Data.Array.Accelerate as A
-import qualified Data.Array.Accelerate.IO as AIO
+import qualified Data.Array.Accelerate.IO.Data.Vector.Storable as AIO
 import qualified Data.Array.Accelerate.Interpreter as AI
 import qualified Data.Array.Accelerate.LLVM.Native as AL
 import qualified Data.Array.Accelerate.Array.Sugar as AS hiding (Elt)
-
-
+import qualified Data.StorableVector                 as SV
+import qualified Data.StorableVector.ST.Strict       as SVST
+import qualified Data.StorableVector.Base            as SVB
+import qualified Data.Vector.Storable                as DVS
+import Control.Concurrent.STM.TBQueue
+import           Foreign.Storable                    (Storable)
+import Control.Concurrent.STM hiding (check)
+import           Foreign.C.Types                     (CFloat (..))
+import           Data.Coerce                         (coerce)
+import           Control.Monad.ST.Strict             as ST
+import           Control.Monad                       (liftM)
+import           Debug.Trace                         (trace)
 data AudRate
 
 newtype SF a b = SF
@@ -119,29 +132,24 @@ instance ArrowCircuit SF where
 type Signal clk a b = ArrowP SF clk a b
 type SigFun clk a b = ArrowP SF clk a b
 
--- Arbitrary number of channels (say, 5.1) can be supported by just adding more
--- instances of the AudioSample type class.
-
 class AudioSample a where
   zero :: a
   mix :: a -> a -> a
   collapse :: a -> [Double]
   numChans :: a -> Int
-      -- allows us to reify the number of channels from the type.
       
 type SEvent a = Maybe a
 
 class Clock p a where
-  rate :: p -> A.Exp a -- sampling rate
+  rate :: p -> A.Exp a
     
 data Table a =
-  Table !(A.Acc (A.Scalar Int)) -- size
-        !(A.Acc (A.Array A.DIM1 a)) -- table implementation
-        !(A.Acc (A.Scalar Bool)) -- Whether the table is normalized
+  Table !(A.Acc (A.Scalar Int)) 
+        !(A.Acc (A.Array A.DIM1 a))
+        !(A.Acc (A.Scalar Bool))
 
 instance (A.Elt a) => Show (Table a) where
   show (Table sz a n) = "Table with " ++ show sz ++ " entries: " ++ show a
-
 
 funToTable ::
      (A.Num a, A.Ord a, A.Fractional a, A.FromIntegral Int a)
@@ -154,11 +162,10 @@ funToTable f normalize size =
         A.enumFromStepN
           ((A.index1 (A.the size)))
           0
-          (A.recip $ A.fromIntegral (A.the size)) -- :: A.Acc (A.Array A.DIM1 a)
-      ys = A.map f xs -- :: A.Acc (A.Array A.DIM1 a)
+          (A.recip $ A.fromIntegral (A.the size))
+      ys = A.map f xs
       zs = A.acond (A.the normalize) (A.map (A./ (maxabs ys)) ys) ys
-      maxabs =
-        A.the Prelude.. A.maximum Prelude.. A.map A.abs -- :: A.Acc (A.Array A.DIM1 a) -> A.Exp a
+      maxabs = A.the Prelude.. A.maximum Prelude.. A.map A.abs
   in Table size zs normalize
 
 
@@ -184,22 +191,23 @@ fillLength ::
 fillLength l v =
     A.fill (A.constant (A.Z A.:. l)) v
 
-type Numeric a
+type Audio a
    = ( A.Elt a
      , A.RealFrac a
      , Fractional (A.Exp a)
      , Num a
+     , Fractional a
      , Floating (A.Exp a)
      , A.FromIntegral Int a)
 
-instance forall i l a. (KnownNat l, Numeric a) =>
+instance forall i l a. (KnownNat l, Audio a) =>
          AudioSample (AccSample i l a) where
   zero =
     let s = fromIntegral $ natVal (Proxy :: Proxy l) :: Int
         z = fillLength s 0.0
     in AccSample z
   mix (AccSample a) (AccSample b) = (AccSample $ A.zipWith (A.+) a b)
-  collapse (AccSample a) = [2.0] -- float2Double $ A.toList . A.run $ a
+  collapse (AccSample a) = [2.0]
   numChans _ = 1
 
 instance forall i l a. (KnownNat l, A.Elt a, Fractional (A.Exp a)) =>
@@ -213,7 +221,6 @@ instance forall i l a. (KnownNat l, A.Elt a, Fractional (A.Exp a)) =>
   collapse (AccSample a, AccSample b) = [2.0]
   numChans _ = 2
 
--- run a signal with an accelerate interpreter
 runSignal ::
      Interpreter i
   => Signal c b (AccSample i l a)
@@ -223,7 +230,6 @@ runSignal s i =
     let (AccSample r, SF _) = runSF (strip s) i
     in r
 
--- Tell accelerate to run a signal that is parameterized by A.Acc b and which outputs an AccSample i l a to a storable vector.
 class Interpreter i where
   runToStorable ::
        (A.Arrays b, Num a, A.Elt a)
@@ -267,89 +273,90 @@ pow
     => A.Exp a -> A.Exp a -> A.Exp a
 pow a b = A.exp (A.log a A.* b)
 
---Reads a window of size modu starting at pos from the table.  wraps the window as needed
--- change this to tak e start and end phase
+
 readFromTable
     :: forall i l a.
-       (KnownNat l, Numeric a)
+       (KnownNat l, Audio a)
     => Table a -> A.Exp a -> (AccSample i l a)
 readFromTable (Table sz array _) pos =
-    let modu =
-            A.the $ A.unit (fromIntegral $ natVal (Proxy :: Proxy l)) :: A.Exp Int
-        idx = A.truncate (A.fromIntegral (A.the sz) A.* pos)
-        idx2 = (idx + modu)
-        wrp =
-            A.the $
-            A.zipWith (A.-) sz (A.zipWith (A.+) (A.unit idx) (A.unit idx2))
-        sl = A.drop (idx A.+ idx2) array
-    in AccSample $
-       A.ifThenElse
-           (idx2 A.< idx)
-           ((A.take idx2 sl) A.++ (A.take wrp array))
-           sl
+  let modu =
+        A.the $ A.unit (fromIntegral $ natVal (Proxy :: Proxy l)) :: A.Exp Int
+      start = A.truncate (A.fromIntegral (A.the sz) A.* pos)
+      end = (start + modu)
+      wrp =
+        A.the $ A.zipWith (A.-) sz (A.zipWith (A.+) (A.unit start) (A.unit end))
+      sl = A.drop (start A.+ end) array
+  in AccSample $
+     A.ifThenElse
+       (end A.<= start)
+       ((A.take end sl) A.++ (A.take wrp array))
+       array
 
-readFromTableA :: (Arrow a, KnownNat l, Numeric aa) => Table aa -> a (A.Exp aa) (AccSample i l aa)
+readFromTableA :: (Arrow a, KnownNat l, Audio aa) => Table aa -> a (A.Exp aa) (AccSample i l aa)
 readFromTableA = arr Prelude.. readFromTable 
 
 outA :: (Arrow a) => a b b
 outA = arr Prelude.id
 
 
-countDown :: ArrowCircuit a => Int -> a () Int
-countDown x = proc _ -> do
-    rec i <- delay x -< i - 1
-    outA -< i
+readFromTable' (Table _ array _) = AccSample array
 
-countUp :: ArrowCircuit a => a () Int
-countUp = proc _ -> do
-    rec i <- delay 0 -< i + 1
-    outA -< i
+type Phase a = A.Exp a
+type Frequency a = A.Exp a
 
-osc
-    :: forall p a aa l i.
-       (Clock p aa, ArrowCircuit a, A.FromIntegral Int aa, Floating aa, KnownNat l, Numeric aa, A.Ord aa, A.ToFloating Int aa)
-    => Table aa -> A.Exp aa -> ArrowP a p (A.Exp aa) (AccSample i l aa)
-osc table@(Table sz _ _) iphs =
-    let ofst = -- why is this offset this value?  sample size / block = window?
-            A.fromIntegral (A.the sz) A./
-            (A.the $ A.unit (fromIntegral $ natVal (Proxy :: Proxy l)))
-    in osc_ iphs ofst >>> readFromTableA table
-
-osc_
-    :: forall p a aa.
-       ( Clock p aa, ArrowCircuit a, A.RealFrac aa, Num aa, A.Floating aa, A.ToFloating Int aa)
-    => A.Exp aa -> A.Exp aa -> ArrowP a p (A.Exp aa) (A.Exp aa)
-osc_ phs phsofst =
-   let sr = rate (undefined :: p)
-   in proc freq -> do
-     rec
-       let delta = (A.lift sr) A.* freq
-           phase = (A.ifThenElse (next A.> (A.constant 1)) (frac next) next)
-           phdlt = phase + delta
-           win = phs + phsofst
-       next <- delay 0 -< (frac (phdlt))
-       nextend <-delay 0 -< frac (phdlt + phsofst)
-     outA -< phase
-
--- Generate a sine wave as an accelerate sample
 sineWave ::
      forall c i a l.
-     ( Clock c a
+     ( Audio a
      , KnownNat l
-     , A.Fractional a
-     , Fractional a
-     , A.Ord a
-     , A.FromIntegral Int a
-     , A.RealFrac a
-     , A.Floating a
-     , Floating a
-     , A.ToFloating Int a
+     , ArrowApply (ArrowP SF c)
      )
-  => Int
-  -> Signal c (A.Acc (A.Array A.DIM1 a)) (AccSample i l a)
-sineWave rt =
-           let freq = A.constant 440.0
-               nrm = A.unit ( A.lift False)
-               sz = A.unit (A.lift rt)
-               tbl = funToTable A.sin nrm sz
-           in proc _ ->  osc tbl (A.the $ A.unit 0) -< freq
+  =>Signal c (Frequency a, Phase a) (AccSample i l a)
+sineWave  = proc (freq, phs) -> do
+             let nrm = A.unit ( A.lift False)
+             let amp = A.constant $ 0.9999
+             let tbl = funToTable (\x -> amp A.* A.sin (A.constant 2.0 * A.pi * x * freq) ) nrm (A.unit  (A.constant (fromIntegral $ natVal (Proxy :: Proxy l))))
+             let rd = (readFromTableA tbl)
+             rd -<< phs
+
+-- This cannot be polymorphic in a to unify with the EltRepr a of runToStorable
+generateSample :: (A.Arrays npts, Interpreter i) => npts -> Signal c (A.Acc (npts)) (AccSample i l Float) -> DVS.Vector Float
+generateSample npts sig = runToStorable sig npts
+
+
+arrange
+ ::  (Storable a, Num a, Show a) => Int -> DVS.Vector a -> SV.Vector CFloat
+arrange size evs =
+  SVST.runSTVector
+    (do v <- SVST.new (fromIntegral size) 0
+        unsafeAddChunkToBuffer v evs
+        return $ coerce v)
+
+
+unsafeFrameToQueue ::
+     ( KnownNat l, A.Arrays npt, Interpreter i
+     )
+                 =>Signal c (A.Acc npt) (AccSample i l Float) -> npt-> TBQueue (DVS.Vector Float) -> Int  -> IO ()
+unsafeFrameToQueue fn npt queue ln = go 100 ln (generateSample npt fn)
+  where
+    go (c :: Int) l vc
+      | c > 0 = do
+        let (h, t) = (DVS.unsafeTake l vc, DVS.unsafeDrop l vc)
+        atomically $ writeTBQueue queue h
+        go (c - 1) l t
+      | otherwise = go 100 ln (generateSample npt fn)
+        
+processAudio queu ln =
+  unsafeFrameToQueue sineWave (A.constant 440.0, A.constant 0)
+
+  
+instance Clock AudRate Float where
+    rate _ = A.constant 96000
+
+unsafeAddChunkToBuffer :: (Storable a, Num a, Show a ) =>
+   SVST.Vector s a -> DVS.Vector a -> ST s ()
+unsafeAddChunkToBuffer v xs =
+  let go i j =
+        if j >= DVS.length xs
+          then return ()
+          else SVST.unsafeModify v i ((xs DVS.! j) +) >> go (i + 1) (j + 1)
+  in go 0 0

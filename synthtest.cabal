@@ -16,9 +16,10 @@ tested-with:         GHC == 8.2.1
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib, Utils
-  ghc-options:         -Wall -O3
+  exposed-modules:     Lib, Utils, State
+  ghc-options:         -Wall -O2 -threaded -fllvm -rtsopts -with-rtsopts=-n2M -with-rtsopts=-A64M
   build-depends:       base >= 3 && < 5,
+                        base-compat >= 0.9.1   && < 0.11,
                 arrows >= 0.4,
                 array,
                 deepseq,
@@ -26,21 +27,31 @@ library
                 PortMidi,
                 HCodecs >= 0.2,
                 stm,
+                lens,
                 containers,
+                algebraic-graphs,
                 bytestring,
                 heap >= 1.0,
                 midi,
                 jack,
                 storablevector,
-                  vector,
+                vector,
+                async,
                 event-list,
                 transformers,
                 explicit-exception,
                 non-negative,
+                vector-sized,
                 accelerate,
-                       accelerate-llvm,
-                        accelerate-llvm-native,
-                accelerate-io
+                accelerate-llvm,
+                accelerate-llvm-native,
+                accelerate-io,
+                mwc-random-accelerate,
+                finite-typelits,
+                recursion-schemes,
+                dependent-map
+
+
 
   default-language:    Haskell2010
 
